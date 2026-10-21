@@ -215,6 +215,7 @@ st.warning('Only Planday Shift type = Picking is included. Planday has no employ
 
 # Station summaries: use matched tasks for the actual OLPH numerator.
 station_task = selected.groupby('port_id').agg(Records=('port_id', 'size'), Bins=('bin_count', 'sum'), SKU=('sku_count', 'sum'), Task_Seconds=('time_spent_total', 'sum')).reset_index()
+station_task['Average_Bins'] = station_task['Bins'] / station_task['Records'].replace(0, np.nan)
 station_task['Task_Hours'] = station_task['Task_Seconds'] * factor / 3600
 station_task['Theoretical_OLPH'] = station_task['Bins'] / station_task['Task_Hours'].replace(0, np.nan)
 station_matched = matched_selected.groupby('port_id').agg(Matched_Bins=('bin_count', 'sum'), Matched_Records=('port_id', 'size')).reset_index()
@@ -236,14 +237,15 @@ with st.expander('Data Validation — Picking shifts and matching'):
     st.caption('Shift deduplication is heuristic. Task matching uses task start_time and station. Overlapping shifts and multiple employees may bias working-hour totals.')
 
 st.subheader('Station Comparison')
-metric_map = {'Theoretical OLPH*': 'Theoretical_OLPH', 'Actual OLPH*': 'Actual_OLPH', 'Difference': 'Difference', 'Task Hours': 'Task_Hours', 'Working Hours': 'Working_Hours', 'Total Bins': 'Bins'}
+metric_map = {'Theoretical OLPH*': 'Theoretical_OLPH', 'Actual OLPH*': 'Actual_OLPH', 'Difference': 'Difference', 'Task Hours': 'Task_Hours', 'Working Hours': 'Working_Hours', 'Average Bins per Task': 'Average_Bins'}
 metric = st.selectbox('Compare metric', list(metric_map))
 fig = px.bar(station_summary, x='Station', y=metric_map[metric], title=f'{metric} by Station', text_auto='.1f')
 fig.update_layout(xaxis_type='category')
 st.plotly_chart(fig, use_container_width=True)
 
 # Daily summary
-daily_task = selected.assign(Day=selected['date'].dt.normalize()).groupby(['Day', 'port_id']).agg(Bins=('bin_count', 'sum'), Task_Seconds=('time_spent_total', 'sum')).reset_index()
+daily_task = selected.assign(Day=selected['date'].dt.normalize()).groupby(['Day', 'port_id']).agg(Bins=('bin_count', 'sum'), Records=('bin_count', 'size'), Task_Seconds=('time_spent_total', 'sum')).reset_index()
+daily_task['Average_Bins'] = daily_task['Bins'] / daily_task['Records'].replace(0, np.nan)
 daily_task['Task_Hours'] = daily_task['Task_Seconds'] * factor / 3600
 daily_task['Theoretical_OLPH'] = daily_task['Bins'] / daily_task['Task_Hours'].replace(0, np.nan)
 daily_matched = matched_selected.assign(Day=matched_selected['date'].dt.normalize()).groupby(['Day', 'port_id']).agg(Matched_Bins=('bin_count', 'sum')).reset_index()
@@ -259,7 +261,7 @@ fig_daily.update_layout(hovermode='x unified')
 st.plotly_chart(fig_daily, use_container_width=True)
 
 st.subheader('Station Summary Table')
-show_cols = ['Station', 'Records', 'Bins', 'Task_Hours', 'Matched_Records', 'Matched_Bins', 'Working_Hours', 'Theoretical_OLPH', 'Actual_OLPH', 'Difference']
+show_cols = ['Station', 'Records', 'Average_Bins', 'Task_Hours', 'Matched_Records', 'Matched_Bins', 'Working_Hours', 'Theoretical_OLPH', 'Actual_OLPH', 'Difference']
 st.dataframe(station_summary[show_cols].round(2), use_container_width=True, hide_index=True)
 with st.expander('Daily Summary Table'):
     st.dataframe(daily.round(2), use_container_width=True, hide_index=True)
