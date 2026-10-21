@@ -27,81 +27,89 @@ def load_data(auto_path, auto_mtime, pd_path, pd_mtime):
 
 auto, pd_raw = load_data(str(AUTO_FILE), AUTO_FILE.stat().st_mtime_ns,
                          str(PLANDAY_FILE), PLANDAY_FILE.stat().st_mtime_ns)
-for c in ['date', 'start_time']:
-    auto[c] = pd.to_datetime(auto[c], errors='coerce')
-for c in ['port_id', 'bin_count', 'sku_count', 'time_spent_total', 'time_spent_user']:
-    auto[c] = pd.to_numeric(auto[c], errors='coerce')
-auto['task_type'] = auto['task_type'].astype('string').fillna('(Missing)')
-# Business-defined Pick Type from bin_count (do not rely on source task_type labels).
-auto['pick_type_by_bins'] = pd.Series(pd.NA, index=auto.index, dtype='string')
-auto.loc[auto['bin_count'].between(1, 2), 'pick_type_by_bins'] = 'Small Orders'
-auto.loc[auto['bin_count'].between(3, 6), 'pick_type_by_bins'] = 'Normal Orders'
-auto.loc[auto['bin_count'].ge(7), 'pick_type_by_bins'] = 'Large Orders'
-auto = auto.loc[auto['port_id'].between(101, 112) & auto['date'].notna() & auto['start_time'].notna()].copy()
-auto['port_id'] = auto['port_id'].astype(int)
-for c in ['bin_count', 'sku_count', 'time_spent_total', 'time_spent_user']:
-    auto[c] = auto[c].where(auto[c] >= 0)
-
-pd_raw.columns = pd_raw.columns.str.strip().str.lower().str.replace(' ', '_')
-required_pd = {'date', 'station', 'start_time', 'end_time', 'hours', 'shift_type'}
-if not required_pd.issubset(pd_raw.columns):
-    st.error(f'Missing Planday columns: {sorted(required_pd - set(pd_raw.columns))}')
-    st.stop()
-# Only Planday shifts explicitly labelled Picking are eligible.
-pd_raw = pd_raw.loc[
-    pd_raw['shift_type'].astype('string').str.strip().str.casefold().eq('picking').fillna(False)
-].copy()
-pd_raw['date'] = pd.to_datetime(pd_raw['date'], errors='coerce').dt.normalize()
-# Use the station code at the end of Position, when available.
-if 'position' in pd_raw.columns:
-    station_from_position = pd.to_numeric(
-        pd_raw['position'].astype('string').str.extract(r'(10[1-9]|11[0-2])\s*$')[0],
-        errors='coerce'
+@st.cache_data(show_spinner='Preparing AutoStore and Planday data...')
+def prepare_data(auto, pd_raw):
+    auto = auto.copy()
+    pd_raw = pd_raw.copy()
+    for c in ['date', 'start_time']:
+        auto[c] = pd.to_datetime(auto[c], errors='coerce')
+    for c in ['port_id', 'bin_count', 'sku_count', 'time_spent_total', 'time_spent_user']:
+        auto[c] = pd.to_numeric(auto[c], errors='coerce')
+    auto['task_type'] = auto['task_type'].astype('string').fillna('(Missing)')
+    # Business-defined Pick Type from bin_count (do not rely on source task_type labels).
+    auto['pick_type_by_bins'] = pd.Series(pd.NA, index=auto.index, dtype='string')
+    auto.loc[auto['bin_count'].between(1, 2), 'pick_type_by_bins'] = 'Small Orders'
+    auto.loc[auto['bin_count'].between(3, 6), 'pick_type_by_bins'] = 'Normal Orders'
+    auto.loc[auto['bin_count'].ge(7), 'pick_type_by_bins'] = 'Large Orders'
+    auto = auto.loc[auto['port_id'].between(101, 112) & auto['date'].notna() & auto['start_time'].notna()].copy()
+    auto['port_id'] = auto['port_id'].astype(int)
+    for c in ['bin_count', 'sku_count', 'time_spent_total', 'time_spent_user']:
+        auto[c] = auto[c].where(auto[c] >= 0)
+    
+    pd_raw.columns = pd_raw.columns.str.strip().str.lower().str.replace(' ', '_')
+    required_pd = {'date', 'station', 'start_time', 'end_time', 'hours', 'shift_type'}
+    if not required_pd.issubset(pd_raw.columns):
+        st.error(f'Missing Planday columns: {sorted(required_pd - set(pd_raw.columns))}')
+        st.stop()
+    # Only Planday shifts explicitly labelled Picking are eligible.
+    pd_raw = pd_raw.loc[
+        pd_raw['shift_type'].astype('string').str.strip().str.casefold().eq('picking').fillna(False)
+    ].copy()
+    pd_raw['date'] = pd.to_datetime(pd_raw['date'], errors='coerce').dt.normalize()
+    # Use the station code at the end of Position, when available.
+    if 'position' in pd_raw.columns:
+        station_from_position = pd.to_numeric(
+            pd_raw['position'].astype('string').str.extract(r'(10[1-9]|11[0-2])\s*$')[0],
+            errors='coerce'
+        )
+        pd_raw['station'] = station_from_position.fillna(pd.to_numeric(pd_raw['station'], errors='coerce'))
+    else:
+        pd_raw['station'] = pd.to_numeric(pd_raw['station'], errors='coerce')
+    pd_raw['hours'] = pd.to_numeric(pd_raw['hours'], errors='coerce')
+    
+    # Excel time cells may be stored as text, Python time, or timedelta-like strings.
+    def clock_text(value):
+        if pd.isna(value):
+            return None
+        value = str(value).strip()
+        if value in ('', 'NaT', 'None', 'nan'):
+            return None
+        if ' ' in value:
+            value = value.split(' ')[-1]
+        return value
+    
+    pd_raw['start_clock'] = pd_raw['start_time'].map(clock_text)
+    pd_raw['end_clock'] = pd_raw['end_time'].map(clock_text)
+    pd_raw['shift_start'] = pd.to_datetime(pd_raw['date'].dt.strftime('%Y-%m-%d') + ' ' + pd_raw['start_clock'], errors='coerce')
+    pd_raw['shift_end'] = pd.to_datetime(pd_raw['date'].dt.strftime('%Y-%m-%d') + ' ' + pd_raw['end_clock'], errors='coerce')
+    pd_raw.loc[pd_raw['shift_end'] <= pd_raw['shift_start'], 'shift_end'] += pd.Timedelta(days=1)
+    pd_raw['working_hours'] = pd_raw['hours']
+    # Confirmed Hobbii evening-shift picking window: 15:45–23:40, excluding 50 min breaks and final 5 min.
+    evening = (pd_raw['start_clock'].str.startswith('15:45', na=False) & pd_raw['end_clock'].str.startswith('23:45', na=False))
+    pd_raw.loc[evening, 'working_hours'] = 425 / 60
+    # The final five minutes are not part of effective picking time.
+    pd_raw.loc[evening, 'shift_end'] = (
+        pd_raw.loc[evening, 'date'] + pd.Timedelta(hours=23, minutes=40)
     )
-    pd_raw['station'] = station_from_position.fillna(pd.to_numeric(pd_raw['station'], errors='coerce'))
-else:
-    pd_raw['station'] = pd.to_numeric(pd_raw['station'], errors='coerce')
-pd_raw['hours'] = pd.to_numeric(pd_raw['hours'], errors='coerce')
+    pd_raw = pd_raw.loc[
+        pd_raw['station'].between(101, 112) & pd_raw['date'].notna() &
+        pd_raw['shift_start'].notna() & pd_raw['shift_end'].notna() &
+        pd_raw['working_hours'].gt(0)
+    ].copy()
+    pd_raw['station'] = pd_raw['station'].astype(int)
+    
+    # Same signature exported in different files: retain maximum multiplicity found in any ONE file.
+    # This is an approximation: without employee identifiers, duplicate exports cannot
+    # always be distinguished from multiple employees on the same station/shift.
+    # Without employee identifiers, this is a cautious heuristic, not verified deduplication.
+    keys = ['date', 'station', 'shift_start', 'shift_end', 'hours', 'position'] if 'position' in pd_raw.columns else ['date', 'station', 'shift_start', 'shift_end', 'hours']
+    if 'source_file' in pd_raw.columns:
+        pd_raw['_occurrence'] = pd_raw.groupby(keys + ['source_file'], dropna=False).cumcount()
+        pd_raw = pd_raw.drop_duplicates(subset=keys + ['_occurrence']).drop(columns='_occurrence')
+    
+    return auto, pd_raw
 
-# Excel time cells may be stored as text, Python time, or timedelta-like strings.
-def clock_text(value):
-    if pd.isna(value):
-        return None
-    value = str(value).strip()
-    if value in ('', 'NaT', 'None', 'nan'):
-        return None
-    if ' ' in value:
-        value = value.split(' ')[-1]
-    return value
-
-pd_raw['start_clock'] = pd_raw['start_time'].map(clock_text)
-pd_raw['end_clock'] = pd_raw['end_time'].map(clock_text)
-pd_raw['shift_start'] = pd.to_datetime(pd_raw['date'].dt.strftime('%Y-%m-%d') + ' ' + pd_raw['start_clock'], errors='coerce')
-pd_raw['shift_end'] = pd.to_datetime(pd_raw['date'].dt.strftime('%Y-%m-%d') + ' ' + pd_raw['end_clock'], errors='coerce')
-pd_raw.loc[pd_raw['shift_end'] <= pd_raw['shift_start'], 'shift_end'] += pd.Timedelta(days=1)
-pd_raw['working_hours'] = pd_raw['hours']
-# Confirmed Hobbii evening-shift picking window: 15:45–23:40, excluding 50 min breaks and final 5 min.
-evening = (pd_raw['start_clock'].str.startswith('15:45', na=False) & pd_raw['end_clock'].str.startswith('23:45', na=False))
-pd_raw.loc[evening, 'working_hours'] = 425 / 60
-# The final five minutes are not part of effective picking time.
-pd_raw.loc[evening, 'shift_end'] = (
-    pd_raw.loc[evening, 'date'] + pd.Timedelta(hours=23, minutes=40)
-)
-pd_raw = pd_raw.loc[
-    pd_raw['station'].between(101, 112) & pd_raw['date'].notna() &
-    pd_raw['shift_start'].notna() & pd_raw['shift_end'].notna() &
-    pd_raw['working_hours'].gt(0)
-].copy()
-pd_raw['station'] = pd_raw['station'].astype(int)
-
-# Same signature exported in different files: retain maximum multiplicity found in any ONE file.
-# This is an approximation: without employee identifiers, duplicate exports cannot
-# always be distinguished from multiple employees on the same station/shift.
-# Without employee identifiers, this is a cautious heuristic, not verified deduplication.
-keys = ['date', 'station', 'shift_start', 'shift_end', 'hours', 'position'] if 'position' in pd_raw.columns else ['date', 'station', 'shift_start', 'shift_end', 'hours']
-if 'source_file' in pd_raw.columns:
-    pd_raw['_occurrence'] = pd_raw.groupby(keys + ['source_file'], dropna=False).cumcount()
-    pd_raw = pd_raw.drop_duplicates(subset=keys + ['_occurrence']).drop(columns='_occurrence')
+auto, pd_raw = prepare_data(auto, pd_raw)
 
 st.sidebar.header('Filters')
 if auto.empty:
@@ -120,10 +128,9 @@ unit = st.sidebar.selectbox('AutoStore time unit (verify)', ['Seconds', 'Millise
 factor = 1.0 if unit == 'Seconds' else 0.001
 
 start_ts, end_ts = pd.Timestamp(start_date), pd.Timestamp(end_date) + pd.Timedelta(days=1)
-base = auto.loc[auto['date'].ge(start_ts) & auto['date'].lt(end_ts) & auto['port_id'].isin(stations) & auto['pick_type_by_bins'].notna()].copy()
-selected = base.loc[base['pick_type_by_bins'].isin(types)].copy()
-shifts = pd_raw.loc[pd_raw['date'].ge(start_ts) & pd_raw['date'].lt(end_ts) & pd_raw['station'].isin(stations)].copy()
-if selected.empty:
+base = auto.loc[auto['date'].ge(start_ts) & auto['date'].lt(end_ts) & auto['port_id'].isin(stations) & auto['pick_type_by_bins'].notna()]
+shifts = pd_raw.loc[pd_raw['date'].ge(start_ts) & pd_raw['date'].lt(end_ts) & pd_raw['station'].isin(stations)]
+if base.empty or not base['pick_type_by_bins'].isin(types).any():
     st.warning('No AutoStore records for these filters.')
     st.stop()
 
